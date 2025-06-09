@@ -7,7 +7,6 @@ console.log('======= SIMPLE-AGENT.JS INITIALIZATION =======');
 // --- Shopify MCP server configuration ---
 // Ensure OpenAI API key is set
 process.env.OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
 // Define the Shopify MCP server configuration using MCPServerStdio
 // Prepare environment with proper inheritance
 const childEnv = { ...process.env };
