@@ -1,16 +1,11 @@
 import { Router } from 'express';
 import * as prismaClient from '@prisma/client';
 import { run } from '@openai/agents';
-import { simpleChatAgent, initializeMCPServer, closeMCPServer } from './simple-agent.js';
-
-// Debug logging
-console.log('======= AGENT_ORCHESTRATOR.JS INITIALIZATION =======');
+import { basicChatAgent } from './basic-agent.js';
 
 const PrismaClient = prismaClient.PrismaClient;
 const prisma = new PrismaClient();
 const router = Router();
-
-console.log('Created PrismaClient and router');
 
 // Helper to send SSE messages
 function sendSse(res, eventName, data) {
@@ -19,23 +14,49 @@ function sendSse(res, eventName, data) {
     return;
   }
   try {
-    // Use standard SSE format with separate event and data lines
-    // This matches what the frontend expects
     console.log(`Sending SSE event: ${eventName}`);
     res.write(`event: ${eventName}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   } catch (e) {
     console.error(`BACKEND Orchestrator: Error writing to SSE stream (event: ${eventName}):`, e.message);
-    // Consider ending the stream if a write error occurs, as it's likely unrecoverable.
     if (!res.writableEnded) {
       res.end();
     }
   }
 }
 
+// Fetch tasks from todo MCP server
+async function fetchTodoTasks() {
+  try {
+    const { MCPServerStdio } = await import('@openai/agents');
+    const todoMCPServer = new MCPServerStdio({
+      name: 'Todo MCP Server for Task Retrieval',
+      command: 'npx',
+      args: ['-y', '@pranavchavda/todo-mcp-server'],
+      env: process.env,
+      shell: true,
+    });
+    
+    await todoMCPServer.connect();
+    
+    const tasksResult = await todoMCPServer.callTool('list_tasks', { 
+      limit: 20,
+      order: 'created_at',
+      direction: 'desc'
+    });
+    
+    await todoMCPServer.close();
+    
+    return tasksResult;
+  } catch (error) {
+    console.error('Error fetching tasks from todo MCP:', error);
+    return null;
+  }
+}
+
 router.post('/run', async (req, res) => {
-  console.log('\n========= AGENT ORCHESTRATOR REQUEST RECEIVED =========');
-  const { message, conv_id: existing_conv_id, image } = req.body || {};
+  console.log('\n========= BASIC ORCHESTRATOR REQUEST RECEIVED =========');
+  const { message, conv_id: existing_conv_id } = req.body || {};
   let conversationId = existing_conv_id;
 
   // Setup SSE
@@ -54,7 +75,7 @@ router.post('/run', async (req, res) => {
     
     console.log('Request message:', message);
 
-    const USER_ID = 1; // Assuming a fixed user ID for now
+    const USER_ID = 1;
     let conversation;
 
     if (conversationId) {
@@ -86,20 +107,18 @@ router.post('/run', async (req, res) => {
     });
     console.log('Persisted user message');
 
-    // Fetch full history for context
+    // Fetch conversation history
     const history = await prisma.messages.findMany({
       where: { conv_id: conversationId },
       orderBy: { id: 'asc' },
     });
 
-    // Format the conversation history
     const MAX_HISTORY_MESSAGES = parseInt(process.env.MAX_HISTORY_MESSAGES || '10', 10);
     const recentHistory = history.slice(-MAX_HISTORY_MESSAGES);
     const historyText = recentHistory.map(m => `${m.role}: ${m.content}`).join('\n');
     
     console.log('Formatted conversation history with', recentHistory.length, 'messages');
 
-    // Prepare the agent input
     let agentInput = message;
     if (historyText) {
       agentInput = `Previous conversation:\n${historyText}\n\nUser: ${message}`;
@@ -107,38 +126,64 @@ router.post('/run', async (req, res) => {
     
     console.log('Agent input prepared');
     
-    // Notify client with the conversation ID
+    // Notify client with conversation ID
     sendSse(res, 'conv_id', { conversationId });
+    
+    // Send planner status to indicate planning phase has started
+    sendSse(res, 'planner_status', { state: 'planning', plan: null });
 
-    // Initialize and run agent
-    let assistantResponse = '';
-    try {
-      // Initialize MCP server
-      console.log('Initializing MCP server...');
-      await initializeMCPServer();
-      console.log('MCP server initialized');
+    // Run agent
+    console.log('Running basic agent...');
+    const result = await run(basicChatAgent, agentInput);
+    console.log('Agent run completed');
+    
+    // Now fetch tasks directly from todo MCP server
+    console.log('Fetching tasks from todo MCP server...');
+    const tasksResult = await fetchTodoTasks();
+    
+    if (tasksResult && tasksResult.tasks && tasksResult.tasks.length > 0) {
+      // Convert to our task progress format
+      const taskProgressItems = tasksResult.tasks.map(task => ({
+        id: task.id,
+        content: task.title,
+        status: task.status === 'completed' ? 'completed' : 'pending',
+        conversation_id: conversationId,
+        toolName: 'todo_task',
+        action: task.description,
+        args: task
+      }));
       
-      // Run the agent directly using the run() function - following the examples pattern
-      console.log('Running simple agent with MCP...');
+      console.log('Sending task progress items to frontend:', taskProgressItems.length, 'tasks');
       
-      // Run the agent with the formatted input
-      console.log('Agent input (first 100 chars):', agentInput.substring(0, 100) + (agentInput.length > 100 ? '...' : ''));
-      const result = await run(simpleChatAgent, agentInput);
-      console.log('Agent run completed');
+      // Send planner status with the tasks
+      sendSse(res, 'planner_status', { state: 'completed', plan: taskProgressItems });
       
-      // Extract the final output from the result
-      assistantResponse = result.finalOutput || '';
-      console.log('Response received, length:', assistantResponse.length);
-      
-      // Stream the response to the client
-      sendSse(res, 'assistant_response', { content: assistantResponse });
-      
-    } catch (agentError) {
-      console.error('Error running agent:', agentError);
-      throw agentError;
+      // Send individual task progress events
+      taskProgressItems.forEach(task => {
+        sendSse(res, 'task_progress', {
+          taskId: task.id,
+          status: task.status,
+          description: task.content,
+          toolName: task.toolName,
+          action: task.action,
+          args: task.args
+        });
+      });
+    } else {
+      console.log('No tasks found in todo MCP');
+      sendSse(res, 'planner_status', { state: 'completed', plan: [] });
     }
     
-    // Persist the assistant message
+    // Extract the final output from the result
+    const assistantResponse = result.finalOutput || '';
+    console.log('Response received, length:', assistantResponse.length);
+    
+    // Send conversation ID and response
+    sendSse(res, 'conversation_id', { conv_id: conversationId });
+    sendSse(res, 'assistant_delta', { delta: assistantResponse });
+    sendSse(res, 'done', {});
+    
+    // Persist assistant message
     if (assistantResponse.trim()) {
       await prisma.messages.create({
         data: {
@@ -151,44 +196,23 @@ router.post('/run', async (req, res) => {
     }
 
   } catch (error) {
-    console.error('\n====== AGENT ORCHESTRATOR ERROR ======');
+    console.error('\n====== BASIC ORCHESTRATOR ERROR ======');
     console.error('Error:', error);
-    console.error('Error name:', error.name);
-    console.error('Error message:', error.message);
-    console.error('Error stack:', error.stack);
     
     if (!res.writableEnded) {
       sendSse(res, 'error', { 
-        message: 'An unexpected error occurred in the orchestrator.', 
+        message: 'An error occurred', 
         details: error.message
       });
-    } else {
-      console.warn("BACKEND Orchestrator: Stream ended before error could be sent to client.");
-    }
-    
-    // Ensure the stream is ended if an error occurs and we haven't explicitly ended it.
-    if (!res.writableEnded) {
-      console.log("BACKEND Orchestrator: Ending stream due to error.");
-      res.end();
     }
   } finally {
-    // Close the MCP server regardless of success/failure
-    try {
-      console.log('Closing MCP server...');
-      await closeMCPServer();
-      console.log('MCP server closed');
-    } catch (closeErr) {
-      console.error('Error closing MCP server:', closeErr);
-    }
-    
-    // Only send 'done' event and end response if not already ended
     if (!res.writableEnded) {
       sendSse(res, 'done', {});
       res.end();
       console.log('Stream ended with done event');
     }
     
-    console.log('========= AGENT ORCHESTRATOR REQUEST COMPLETED =========');
+    console.log('========= BASIC ORCHESTRATOR REQUEST COMPLETED =========');
   }
 });
 

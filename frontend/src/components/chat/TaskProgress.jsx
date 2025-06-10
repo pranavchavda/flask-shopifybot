@@ -4,7 +4,7 @@ import { Button } from "@common/button";
 import { Text, Code } from "@common/text";
 import { Badge } from "@common/badge";
 
-export function TaskProgress({ tasks, onInterrupt, isStreaming, conversationId }) {
+export function TaskProgress({ tasks, onInterrupt, isStreaming, conversationId, plannerStatus, dispatcherStatus, synthesizerStatus }) {
   // Filter tasks by conversation_id if both are provided
   const filteredTasks = conversationId && tasks ? 
     tasks.filter(task => !task.conversation_id || task.conversation_id === conversationId) : 
@@ -58,6 +58,16 @@ export function TaskProgress({ tasks, onInterrupt, isStreaming, conversationId }
           <Badge color="blue">
             {completedTasks}/{totalTasks}
           </Badge>
+          
+          {/* Show current execution phase */}
+          {(plannerStatus || dispatcherStatus || synthesizerStatus) && (
+            <div className="flex items-center gap-1">
+              <div className="h-2 w-2 bg-blue-500 rounded-full animate-pulse"></div>
+              <Text className="text-xs text-blue-700 dark:text-blue-300">
+                {synthesizerStatus || dispatcherStatus || plannerStatus}
+              </Text>
+            </div>
+          )}
         </div>
         {isStreaming && onInterrupt && (
           <Button 
@@ -83,19 +93,74 @@ export function TaskProgress({ tasks, onInterrupt, isStreaming, conversationId }
 
       {/* Task list */}
       <div className="space-y-2">
-        {filteredTasks.map((task, index) => (
+        {filteredTasks.slice().reverse().map((task, index) => (
           <div key={task.id || index} className="flex items-start gap-2">
             {getStatusIcon(task.status)}
             <div className="flex-1 min-w-0">
-              <Text 
-                className={`text-sm ${
-                  task.status === "completed" 
-                    ? "line-through text-gray-600 dark:text-gray-400" 
-                    : "text-gray-900 dark:text-gray-100"
-                }`}
-              >
-                {task.content}
-              </Text>
+              <div className="flex-1">
+                <Text 
+                  className={`text-sm font-medium ${
+                    task.status === "completed" 
+                      ? "line-through text-gray-600 dark:text-gray-400" 
+                      : "text-gray-900 dark:text-gray-100"
+                  }`}
+                >
+                  {task.content}
+                </Text>
+                
+                {/* Show tool and action details */}
+                {(task.toolName || task.action) && (
+                  <div className="mt-1 flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                    {task.toolName && (
+                      <Badge size="sm" color="gray" className="text-xs">
+                        {task.toolName}
+                      </Badge>
+                    )}
+                    {task.action && (
+                      <Code className="text-xs">
+                        {task.action}
+                      </Code>
+                    )}
+                  </div>
+                )}
+                
+                {/* Show task arguments in collapsible format */}
+                {task.args && Object.keys(task.args).length > 0 && (
+                  <details className="mt-1 group">
+                    <summary className="text-xs text-gray-500 dark:text-gray-400 cursor-pointer select-none hover:text-gray-700 dark:hover:text-gray-300">
+                      View parameters
+                    </summary>
+                    <div className="mt-1 bg-gray-50 dark:bg-gray-800 rounded p-2">
+                      <pre className="text-xs text-gray-700 dark:text-gray-300 whitespace-pre-wrap">
+                        {JSON.stringify(task.args, null, 2)}
+                      </pre>
+                    </div>
+                  </details>
+                )}
+                
+                {/* Show task result if available */}
+                {task.result && (
+                  <details className="mt-1 group">
+                    <summary className="text-xs text-green-600 dark:text-green-400 cursor-pointer select-none hover:text-green-700 dark:hover:text-green-300">
+                      View result
+                    </summary>
+                    <div className="mt-1 bg-green-50 dark:bg-green-900/20 rounded p-2">
+                      <pre className="text-xs text-green-700 dark:text-green-300 whitespace-pre-wrap">
+                        {typeof task.result === 'string' ? task.result : JSON.stringify(task.result, null, 2)}
+                      </pre>
+                    </div>
+                  </details>
+                )}
+                
+                {/* Show error if available */}
+                {task.error && (
+                  <div className="mt-1 bg-red-50 dark:bg-red-900/20 rounded p-2">
+                    <Text className="text-xs text-red-700 dark:text-red-300">
+                      Error: {task.error}
+                    </Text>
+                  </div>
+                )}
+              </div>
               {task.subtasks && task.subtasks.length > 0 && (
                 <div className="ml-4 mt-1 space-y-1">
                   {task.subtasks.map((subtask, subIndex) => (

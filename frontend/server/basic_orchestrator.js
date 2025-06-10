@@ -116,8 +116,193 @@ router.post('/run', async (req, res) => {
       console.log('Running basic agent...');
       console.log('Agent input (first 100 chars):', agentInput.substring(0, 100) + (agentInput.length > 100 ? '...' : ''));
       
+      // Send planner status to indicate planning phase has started
+      sendSse(res, 'planner_status', { state: 'planning', plan: null });
+      
       // Use the run function directly from @openai/agents
-      const result = await run(basicChatAgent, agentInput);
+      const result = await run(basicChatAgent, agentInput, {
+        onEvent: (event) => {
+          // Handle different agent events for enhanced streaming
+          console.log('=== AGENT EVENT ===');
+          console.log('Event type:', event.type);
+          console.log('Event data keys:', Object.keys(event.data || {}));
+          if (event.data?.tool) {
+            console.log('Tool name:', event.data.tool.name);
+          }
+          console.log('==================');
+          
+          // If this is a tool use event and it's the planner tool
+          if (event.type === 'tool_use' && event.data?.tool?.name === 'plan') {
+            sendSse(res, 'planner_status', { state: 'executing', plan: null });
+          }
+          
+          // If this is a tool result from the planner (now using todo MCP tools)
+          if (event.type === 'tool_result' && event.data?.tool?.name === 'plan') {
+            console.log('Planner completed - now fetching created tasks from todo MCP');
+            
+            // Manually fetch the tasks that were just created (async operation)
+            (async () => {
+              try {
+                const { MCPServerStdio } = await import('@openai/agents');
+                const todoMCPServer = new MCPServerStdio({
+                  name: 'Todo MCP Server for Task Retrieval',
+                  command: 'npx',
+                  args: ['-y', '@pranavchavda/todo-mcp-server'],
+                  env: process.env,
+                  shell: true,
+                });
+                
+                await todoMCPServer.connect();
+                const tasksResult = await todoMCPServer.callTool('list_tasks', { 
+                  limit: 10, 
+                  status: 'pending' 
+                });
+                
+                console.log('Retrieved tasks from todo MCP:', tasksResult);
+                
+                if (tasksResult && tasksResult.tasks) {
+                  // Convert to our task progress format and send to frontend
+                  const taskProgressItems = tasksResult.tasks.map(task => ({
+                    id: task.id,
+                    content: task.title,
+                    status: task.status === 'completed' ? 'completed' : 'pending',
+                    conversation_id: conversationId,
+                    toolName: 'todo_task',
+                    action: task.description,
+                    args: task
+                  }));
+                  
+                  console.log('Sending task progress items to frontend:', taskProgressItems);
+                  
+                  // Send planner status with the tasks
+                  sendSse(res, 'planner_status', { state: 'completed', plan: taskProgressItems });
+                  
+                  // Send individual task progress events
+                  taskProgressItems.forEach(task => {
+                    sendSse(res, 'task_progress', {
+                      taskId: task.id,
+                      status: task.status,
+                      description: task.content,
+                      toolName: task.toolName,
+                      action: task.action,
+                      args: task.args
+                    });
+                  });
+                } else {
+                  sendSse(res, 'planner_status', { state: 'completed', plan: [] });
+                }
+                
+                await todoMCPServer.close();
+              } catch (error) {
+                console.error('Error fetching tasks from todo MCP:', error);
+                sendSse(res, 'planner_status', { state: 'completed', plan: [] });
+              }
+            })();
+          }
+          
+          // Handle ALL tool calls and results with enhanced logging
+          if (event.type === 'tool_use') {
+            console.log('=== TOOL USE EVENT ===');
+            console.log('Tool name:', event.data?.tool?.name);
+            console.log('Tool parameters:', event.data?.tool?.parameters);
+            console.log('Full event data:', JSON.stringify(event.data, null, 2));
+            
+            if (['create_task', 'update_task', 'complete_task', 'list_tasks'].includes(event.data?.tool?.name)) {
+              console.log('✅ Todo MCP tool call detected:', event.data?.tool?.name);
+            }
+          }
+          
+          if (event.type === 'tool_result') {
+            console.log('=== TOOL RESULT EVENT ===');
+            console.log('Tool name:', event.data?.tool?.name);
+            console.log('Tool result:', event.data.result);
+            console.log('Full event data:', JSON.stringify(event.data, null, 2));
+            
+            if (['create_task', 'update_task', 'complete_task', 'list_tasks'].includes(event.data?.tool?.name)) {
+              console.log('✅ Todo MCP tool result detected:', event.data?.tool?.name);
+              
+              try {
+                let result;
+                if (typeof event.data.result === 'string') {
+                  result = JSON.parse(event.data.result);
+                } else {
+                  result = event.data.result;
+                }
+                
+                console.log('Parsed result:', JSON.stringify(result, null, 2));
+                
+                // Convert todo MCP tasks to our task progress format
+                if (event.data?.tool?.name === 'create_task') {
+                  // Handle different possible result formats
+                  let taskData = null;
+                  
+                  if (result.id) {
+                    // Direct task object
+                    taskData = result;
+                  } else if (result.task) {
+                    // Nested task object
+                    taskData = result.task;
+                  } else {
+                    // Try to extract from text response
+                    console.log('Attempting to extract task from text response');
+                    const textMatch = result.text?.match(/{\s*"id":\s*(\d+).*?}/s);
+                    if (textMatch) {
+                      try {
+                        taskData = JSON.parse(textMatch[0]);
+                      } catch (e) {
+                        console.warn('Failed to parse task from text:', e);
+                      }
+                    }
+                  }
+                  
+                  if (taskData && taskData.id) {
+                    console.log('Sending task progress for task:', taskData.id, taskData.title);
+                    sendSse(res, 'task_progress', {
+                      taskId: taskData.id,
+                      status: taskData.status || 'pending',
+                      description: taskData.title,
+                      toolName: 'created_task',
+                      action: taskData.description,
+                      args: taskData
+                    });
+                  } else {
+                    console.warn('Could not extract task data from result:', result);
+                  }
+                }
+              } catch (e) {
+                console.warn('Could not parse todo MCP result:', e);
+              }
+            }
+          }
+          
+          // If this is a tool use event and it's the dispatcher tool
+          if (event.type === 'tool_use' && event.data?.tool?.name === 'dispatch') {
+            sendSse(res, 'task_progress', { status: 'executing_tasks' });
+          }
+          
+          // If this is a tool result from the dispatcher
+          if (event.type === 'tool_result' && event.data?.tool?.name === 'dispatch') {
+            try {
+              const dispatchResult = JSON.parse(event.data.result);
+              const results = dispatchResult?.response || dispatchResult || [];
+              
+              // Update task progress
+              results.forEach(taskResult => {
+                sendSse(res, 'task_progress', { 
+                  taskId: taskResult.taskId, 
+                  status: taskResult.error ? 'failed' : 'completed',
+                  result: taskResult.output || taskResult.error
+                });
+              });
+              
+              sendSse(res, 'dispatcher_done', { results });
+            } catch (e) {
+              console.warn('Could not parse dispatcher result for streaming:', e);
+            }
+          }
+        }
+      });
+      
       console.log('Agent run completed');
       
       // Extract the final output from the result

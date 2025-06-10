@@ -69,8 +69,8 @@ export default defineConfig({
         const chatHandler = (await import('./server/chat')).default;
         const convHandler = (await import('./server/conversations')).default;
         const streamChatHandler = (await import('./server/stream_chat')).default;
-        const agentOrchestratorRouter = (await import('./server/agent_orchestrator')).default;
-        const basicOrchestratorRouter = (await import('./server/basic_orchestrator')).default;
+        // Agent orchestrator v2 removed - using basic orchestrator for all agent modes
+        const basicOrchestratorRouter = (await import('./server/basic_orchestrator_simple')).default;
         const superSimpleOrchestratorRouter = (await import('./server/super-simple-orchestrator')).default;
         const testSseRouter = (await import('./server/test-sse')).default; // Import the test SSE router
 
@@ -80,7 +80,7 @@ export default defineConfig({
         apiApp.use('/api/conversations', convHandler);
         apiApp.use('/api/chat', chatHandler);
         apiApp.use('/stream_chat', streamChatHandler);
-        apiApp.use('/api/agent/v2', agentOrchestratorRouter);
+        // V2 agent orchestrator route removed - all agent modes use basic orchestrator
         apiApp.use('/api/agent/basic', basicOrchestratorRouter); // Add the simple basic agent route
         apiApp.use('/api/agent/super-simple', superSimpleOrchestratorRouter); // Add the super simple agent WITHOUT MCP
         apiApp.use('/api/sse', testSseRouter); // Add the SSE test endpoint for debugging

@@ -25,12 +25,12 @@ function StreamingChatPage({ convId }) {
   const [imageAttachment, setImageAttachment] = useState(null);
   const [plannerStatus, setPlannerStatus] = useState("");
   const [dispatcherStatus, setDispatcherStatus] = useState("");
+  const [synthesizerStatus, setSynthesizerStatus] = useState("");
   const [currentPlan, setCurrentPlan] = useState(null);
   const [imageUrl, setImageUrl] = useState("");
   const [showImageUrlInput, setShowImageUrlInput] = useState(false);
-  const [useAgent, setUseAgent] = useState(false);
-  const [useBasicAgent, setUseBasicAgent] = useState(false);
-  const [useSuperSimpleAgent, setUseSuperSimpleAgent] = useState(false);
+  const [useBasicAgent, setUseBasicAgent] = useState(true);
+  const [useNonAgentic, setUseNonAgentic] = useState(false);
   const messagesEndRef = useRef(null);
   const eventSourceRef = useRef(null);
   const readerRef = useRef(null);
@@ -76,13 +76,13 @@ function StreamingChatPage({ convId }) {
 
   //console.log("FRONTEND RENDER: useAgent:", useAgent, "currentPlan:", currentPlan, "currentTasks:", currentTasks, "streamingMessage:", streamingMessage); // DEBUG
 
-    console.log("FRONTEND RENDER: useAgent:", useAgent, "currentPlan:", currentPlan, "currentTasks:", currentTasks,
+    console.log("FRONTEND RENDER: useBasicAgent:", useBasicAgent, "currentPlan:", currentPlan, "currentTasks:", currentTasks,
     "streamingMessage:", streamingMessage); // DEBUG
     
           // Fallback: if the LLM spits back a pure plan JSON instead of using tool events,
           // detect it on stream completion and seed currentPlan.
           useEffect(() => {
-            if (useAgent && streamingMessage?.isComplete && !currentPlan && streamingMessage.content) {
+            if (useBasicAgent && streamingMessage?.isComplete && !currentPlan && streamingMessage.content) {
               try {
                 const pkg = JSON.parse(streamingMessage.content);
                 if (pkg.response && Array.isArray(pkg.response.tasks)) {
@@ -93,7 +93,7 @@ function StreamingChatPage({ convId }) {
                 // not JSON or not a plan, ignore
               }
             }
-          }, [useAgent, streamingMessage, currentPlan]);
+          }, [useBasicAgent, streamingMessage, currentPlan]);
 
 
   // Auto-scroll to bottom when messages change
@@ -333,25 +333,20 @@ function StreamingChatPage({ convId }) {
 
     try {
       // Determine which endpoint to use based on agent mode
-      let fetchUrl = "/stream_chat"; // Default to non-agent
-      if (useSuperSimpleAgent) {
-        fetchUrl = "/api/agent/super-simple/run"; // Use super simple agent WITHOUT MCP
-        console.log("Using super simple agent endpoint (NO MCP)");
-      } else if (useBasicAgent) {
-        fetchUrl = "/api/agent/basic/run"; // Use simplified basic agent
-        console.log("Using basic agent endpoint");
-      } else if (useAgent) {
-        fetchUrl = "/api/agent/v2/run"; // Use full agent orchestration
-        console.log("Using full agent orchestration endpoint");
+      let fetchUrl = "/api/agent/basic/run"; // Default to basic agent
+      if (useNonAgentic) {
+        fetchUrl = "/stream_chat"; // Use non-agentic mode
+        console.log("Using non-agentic endpoint");
+      } else {
+        console.log("Using unified basic agent endpoint with agentic architecture");
       }
 
-      if (useAgent) {
+      if (useBasicAgent) {
         setPlannerStatus("Initializing...");
         setDispatcherStatus("");
-        setSynthesizerStatus("");
+        setSynthesizerStatus("Initializing...");
         setCurrentPlan(null);
-    setCurrentTasks([]); // Reset tasks for new agent run
-        setCurrentTasks([]);
+        setCurrentTasks([]); // Reset tasks for new agent run
         setToolCallStatus("");
       }
 
@@ -432,10 +427,10 @@ function StreamingChatPage({ convId }) {
 
               // If eventName wasn't set by an 'event:' line, 
               // and we are using the agent, try to get it from the parsed data structure.
-              if (!eventName && useAgent && parsedData.type) {
+              if (!eventName && useBasicAgent && parsedData.type) {
                 eventName = parsedData.type;
                 actualEventPayload = parsedData.data !== undefined ? parsedData.data : {}; // Use .data if it exists, otherwise empty obj
-              } else if (!eventName && !useAgent && singleEventString.startsWith('data:')) {
+              } else if (!eventName && useNonAgentic && singleEventString.startsWith('data:')) {
                 // Legacy /stream_chat handling (eventName remains null, payload is parsedData)
                 actualEventPayload = parsedData;
               }
@@ -461,7 +456,7 @@ function StreamingChatPage({ convId }) {
                 break;
               }
             
-              if (useAgent) {
+              if (useBasicAgent) {
                 switch (eventName) {
                 case 'conversation_id':
                   if (actualEventPayload.conv_id && (!activeConv || activeConv !== actualEventPayload.conv_id)) {
@@ -473,23 +468,87 @@ function StreamingChatPage({ convId }) {
                   }
                   break;
                 case 'planner_status':
-                  setPlannerStatus(actualEventPayload.status === 'completed' ? `Plan: ${actualEventPayload.status}` : `Planner: ${actualEventPayload.status}`);
-                  if (actualEventPayload.status === 'completed') {
-                    if (actualEventPayload.plan && Array.isArray(actualEventPayload.plan.tasks)) {
-                      console.log("FRONTEND: Setting currentPlan with extracted tasks:", actualEventPayload.plan.tasks); // DEBUG
-                      setCurrentPlan(actualEventPayload.plan.tasks);
-                    } else if (Array.isArray(actualEventPayload.plan)) { // Fallback if plan is already an array
-                      console.log("FRONTEND: Setting currentPlan (payload was already an array):", actualEventPayload.plan); // DEBUG
+                  console.log("FRONTEND: Received planner_status event:", JSON.stringify(actualEventPayload, null, 2));
+                  setPlannerStatus(actualEventPayload.state === 'completed' ? `Plan: ${actualEventPayload.state}` : `Planner: ${actualEventPayload.state}`);
+                  if (actualEventPayload.state === 'completed' && actualEventPayload.plan) {
+                    console.log("FRONTEND: Plan completed with plan:", actualEventPayload.plan);
+                    if (Array.isArray(actualEventPayload.plan)) {
+                      console.log("FRONTEND: Setting currentPlan from planner_status:", actualEventPayload.plan); // DEBUG
                       setCurrentPlan(actualEventPayload.plan);
+                      
+                      // Convert plan tasks to task progress items
+                      const taskProgressItems = actualEventPayload.plan.map(task => ({
+                        id: task.id,
+                        content: task.description,
+                        status: 'pending',
+                        conversation_id: activeConv || convId,
+                        toolName: task.agent_tool_name,
+                        action: task.args?.action,
+                        args: task.args?.args || task.args
+                      }));
+                      
+                      console.log("FRONTEND: Creating task progress items:", taskProgressItems);
+                      setCurrentTasks(taskProgressItems);
                     } else {
-                      console.warn("FRONTEND: Received plan is not in expected format (object with tasks array or direct array):", actualEventPayload.plan);
+                      console.warn("FRONTEND: Received plan is not an array:", actualEventPayload.plan);
                       setCurrentPlan([]); // Set to empty array to avoid errors
                     }
+                  } else {
+                    console.log("FRONTEND: Plan not completed or no plan in payload");
                   }
                   break;
-                case 'dispatcher_status':
-                  setDispatcherStatus(`Dispatcher: ${actualEventPayload.status}`);
-                  if(actualEventPayload.status === 'completed') setPlannerStatus("Plan execution completed.");
+                case 'task_progress':
+                  if (actualEventPayload.taskId && actualEventPayload.status) {
+                    setCurrentTasks(prevTasks => {
+                      const existingTaskIndex = prevTasks.findIndex(t => t.id === actualEventPayload.taskId);
+                      
+                      if (existingTaskIndex !== -1) {
+                        // Update existing task
+                        const updatedTasks = [...prevTasks];
+                        updatedTasks[existingTaskIndex] = {
+                          ...prevTasks[existingTaskIndex],
+                          status: actualEventPayload.status,
+                          content: actualEventPayload.description || updatedTasks[existingTaskIndex].content,
+                          result: actualEventPayload.result,
+                          conversation_id: activeConv || convId
+                        };
+                        return updatedTasks;
+                      } else if (actualEventPayload.status === 'pending') {
+                        // Add new pending task
+                        const newTask = {
+                          id: actualEventPayload.taskId,
+                          status: actualEventPayload.status,
+                          content: actualEventPayload.description || `Task ${actualEventPayload.taskId}`,
+                          conversation_id: activeConv || convId
+                        };
+                        return [...prevTasks, newTask];
+                      }
+                      return prevTasks;
+                    });
+                  } else if (actualEventPayload.status === 'executing_tasks') {
+                    setDispatcherStatus("Dispatcher: executing tasks...");
+                  }
+                  break;
+                case 'dispatcher_done':
+                  if (actualEventPayload.results && Array.isArray(actualEventPayload.results)) {
+                    // Update tasks with final results
+                    setCurrentTasks(prevTasks => {
+                      const updatedTasks = [...prevTasks];
+                      actualEventPayload.results.forEach(result => {
+                        const taskIndex = updatedTasks.findIndex(t => t.id === result.taskId);
+                        if (taskIndex !== -1) {
+                          updatedTasks[taskIndex] = {
+                            ...updatedTasks[taskIndex],
+                            status: result.error ? 'error' : 'completed',
+                            result: result.output || result.error,
+                            error: result.error
+                          };
+                        }
+                      });
+                      return updatedTasks;
+                    });
+                  }
+                  setDispatcherStatus("Dispatcher: completed");
                   break;
                 case 'dispatcher_event':
                   setDispatcherStatus("Dispatcher: running task...");
@@ -779,7 +838,7 @@ function StreamingChatPage({ convId }) {
                   >
                     <div className="w-full break-words prose dark:prose-invert prose-sm max-w-none">
                     {/* Display Plan Steps if in Agent Mode and plan exists */}
-                    {useAgent && currentPlan && currentPlan.length > 0 && (
+                    {useBasicAgent && currentPlan && currentPlan.length > 0 && (
                       <div className="mb-2 p-2 rounded-md bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800/30">
                         <h4 className="font-semibold text-xs mb-1 text-blue-700 dark:text-blue-300">Execution Plan:</h4>
                         <ol className="list-decimal list-inside text-xs text-blue-600 dark:text-blue-400 space-y-0.5">
@@ -823,13 +882,17 @@ function StreamingChatPage({ convId }) {
                       </div>
                     )}
 
-                    {/* Task Progress - only if useAgent is true */}
-                    {useAgent && currentTasks.length > 0 && (
+                    {/* Task Progress - only if useBasicAgent is true */}
+                    {useBasicAgent && (currentTasks.length > 0 || plannerStatus || dispatcherStatus || synthesizerStatus) && (
                       <div className="mb-2">
                         <TaskProgress
                           tasks={currentTasks}
                           onInterrupt={handleInterrupt}
                           isStreaming={isSending}
+                          conversationId={activeConv || convId}
+                          plannerStatus={plannerStatus}
+                          dispatcherStatus={dispatcherStatus}
+                          synthesizerStatus={synthesizerStatus}
                         />
                       </div>
                     )}
@@ -881,52 +944,19 @@ function StreamingChatPage({ convId }) {
           </div>
         )}
 
-        {/* Image Preview */}
+        {/* Agent Mode Toggle */}
         <div className="mt-2 flex items-center justify-between gap-4">
           <div className="flex items-center space-x-6">
             <SwitchField>
-              <Label htmlFor="agent-mode">Full Agent</Label>
+              <Label htmlFor="non-agentic-mode">Non-Agentic Mode</Label>
               <Switch 
-                checked={useAgent} 
+                checked={useNonAgentic} 
                 onChange={(checked) => {
-                  setUseAgent(checked);
-                  if (checked) {
-                    setUseBasicAgent(false);
-                    setUseSuperSimpleAgent(false);
-                  }
+                  setUseNonAgentic(checked);
+                  setUseBasicAgent(!checked);
                 }} 
-                name="agent-mode" 
-                defaultChecked={useAgent} 
-              />
-            </SwitchField>
-            <SwitchField>
-              <Label htmlFor="basic-agent-mode">Basic Agent</Label>
-              <Switch 
-                checked={useBasicAgent} 
-                onChange={(checked) => {
-                  setUseBasicAgent(checked);
-                  if (checked) {
-                    setUseAgent(false);
-                    setUseSuperSimpleAgent(false);
-                  }
-                }} 
-                name="basic-agent-mode" 
-                defaultChecked={useBasicAgent} 
-              />
-            </SwitchField>
-            <SwitchField>
-              <Label htmlFor="super-simple-agent-mode">No MCP Agent</Label>
-              <Switch 
-                checked={useSuperSimpleAgent} 
-                onChange={(checked) => {
-                  setUseSuperSimpleAgent(checked);
-                  if (checked) {
-                    setUseAgent(false);
-                    setUseBasicAgent(false);
-                  }
-                }} 
-                name="super-simple-agent-mode" 
-                defaultChecked={useSuperSimpleAgent} 
+                name="non-agentic-mode" 
+                defaultChecked={useNonAgentic} 
               />
             </SwitchField>
           </div>
