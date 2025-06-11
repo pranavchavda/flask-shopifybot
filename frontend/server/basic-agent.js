@@ -80,3 +80,4 @@ Use 'plan' tool first, then 'dispatch' tool.`,
 
 console.log('Created basic agent with Shopify and Todo MCP integration and synthesizer functionality');
 console.log('======= BASIC-AGENT.JS INITIALIZATION COMPLETE =======');
+export { todoMCPServer };

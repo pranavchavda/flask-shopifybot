@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import * as prismaClient from '@prisma/client';
 import { run } from '@openai/agents';
-import { basicChatAgent } from './basic-agent.js';
+import { basicChatAgent, todoMCPServer } from './basic-agent.js';
 
 // Debug logging
 console.log('======= BASIC_ORCHESTRATOR.JS INITIALIZATION =======');
@@ -108,6 +108,8 @@ router.post('/run', async (req, res) => {
     
     // Notify client with conversation ID
     sendSse(res, 'conv_id', { conversationId });
+    // Track whether planner completed events were emitted
+    let planCompleted = false;
 
     // Run agent
     let assistantResponse = '';
@@ -121,9 +123,10 @@ router.post('/run', async (req, res) => {
       
       // Use the run function directly from @openai/agents
       const result = await run(basicChatAgent, agentInput, {
-        onEvent: (event) => {
+        onEvent: async (event) => {
           // Handle different agent events for enhanced streaming
           console.log('=== AGENT EVENT ===');
+          console.log(JSON.stringify(event));
           console.log('Event type:', event.type);
           console.log('Event data keys:', Object.keys(event.data || {}));
           if (event.data?.tool) {
@@ -131,73 +134,46 @@ router.post('/run', async (req, res) => {
           }
           console.log('==================');
           
-          // If this is a tool use event and it's the planner tool
-          if (event.type === 'tool_use' && event.data?.tool?.name === 'plan') {
-            sendSse(res, 'planner_status', { state: 'executing', plan: null });
-          }
-          
-          // If this is a tool result from the planner (now using todo MCP tools)
-          if (event.type === 'tool_result' && event.data?.tool?.name === 'plan') {
-            console.log('Planner completed - now fetching created tasks from todo MCP');
-            
-            // Manually fetch the tasks that were just created (async operation)
-            (async () => {
+          if (event.data?.tool?.name === 'plan') {
+            if (event.type === 'tool_use' || event.type === 'tool_start') {
+              sendSse(res, 'planner_status', { state: 'executing', plan: null });
+            }
+            if (event.type === 'tool_result' || event.type === 'tool_end') {
+              console.log('Planner completed - fetching tasks from todo MCP');
               try {
-                const { MCPServerStdio } = await import('@openai/agents');
-                const todoMCPServer = new MCPServerStdio({
-                  name: 'Todo MCP Server for Task Retrieval',
-                  command: 'npx',
-                  args: ['-y', '@pranavchavda/todo-mcp-server'],
-                  env: process.env,
-                  shell: true,
-                });
-                
-                await todoMCPServer.connect();
-                const tasksResult = await todoMCPServer.callTool('list_tasks', { 
-                  limit: 10, 
-                  status: 'pending' 
-                });
-                
-                console.log('Retrieved tasks from todo MCP:', tasksResult);
-                
-                if (tasksResult && tasksResult.tasks) {
-                  // Convert to our task progress format and send to frontend
-                  const taskProgressItems = tasksResult.tasks.map(task => ({
-                    id: task.id,
-                    content: task.title,
-                    status: task.status === 'completed' ? 'completed' : 'pending',
-                    conversation_id: conversationId,
-                    toolName: 'todo_task',
-                    action: task.description,
-                    args: task
-                  }));
-                  
-                  console.log('Sending task progress items to frontend:', taskProgressItems);
-                  
-                  // Send planner status with the tasks
-                  sendSse(res, 'planner_status', { state: 'completed', plan: taskProgressItems });
-                  
-                  // Send individual task progress events
-                  taskProgressItems.forEach(task => {
-                    sendSse(res, 'task_progress', {
-                      taskId: task.id,
-                      status: task.status,
-                      description: task.content,
-                      toolName: task.toolName,
-                      action: task.action,
-                      args: task.args
-                    });
-                  });
-                } else {
-                  sendSse(res, 'planner_status', { state: 'completed', plan: [] });
-                }
-                
-                await todoMCPServer.close();
+                const tasksResult = await todoMCPServer.callTool('list_tasks', { limit: 10, status: 'pending' });
+                const tasksArray = Array.isArray(tasksResult.tasks)
+                  ? tasksResult.tasks
+                  : Array.isArray(tasksResult)
+                  ? tasksResult
+                  : [];
+                const taskProgressItems = tasksArray.map(task => ({
+                  id: task.id,
+                  content: task.title || '',
+                  status: task.status === 'completed' ? 'completed' : 'pending',
+                  conversation_id: conversationId,
+                  toolName: 'todo_task',
+                  action: task.description,
+                  args: task,
+                }));
+                sendSse(res, 'planner_status', { state: 'completed', plan: taskProgressItems });
+                taskProgressItems.forEach(task =>
+                  sendSse(res, 'task_progress', {
+                    taskId: task.id,
+                    status: task.status,
+                    description: task.content,
+                    toolName: task.toolName,
+                    action: task.action,
+                    args: task.args,
+                  })
+                );
+                planCompleted = true;
               } catch (error) {
                 console.error('Error fetching tasks from todo MCP:', error);
                 sendSse(res, 'planner_status', { state: 'completed', plan: [] });
+                planCompleted = true;
               }
-            })();
+            }
           }
           
           // Handle ALL tool calls and results with enhanced logging
@@ -304,17 +280,53 @@ router.post('/run', async (req, res) => {
       });
       
       console.log('Agent run completed');
-      
+
+      // Fallback: if planner completion events were not detected, emit completed plan now
+      if (!planCompleted) {
+        console.log('Planner completion not detected during events, using fallback to fetch tasks');
+        try {
+          const tasksResult = await todoMCPServer.callTool('list_tasks', { limit: 10, status: 'pending' });
+          const tasksArray = Array.isArray(tasksResult.tasks)
+            ? tasksResult.tasks
+            : Array.isArray(tasksResult)
+            ? tasksResult
+            : [];
+          const taskProgressItems = tasksArray.map(task => ({
+            id: task.id,
+            content: task.title || '',
+            status: task.status === 'completed' ? 'completed' : 'pending',
+            conversation_id: conversationId,
+            toolName: 'todo_task',
+            action: task.description,
+            args: task,
+          }));
+          sendSse(res, 'planner_status', { state: 'completed', plan: taskProgressItems });
+          taskProgressItems.forEach(task =>
+            sendSse(res, 'task_progress', {
+              taskId: task.id,
+              status: task.status,
+              description: task.content,
+              toolName: task.toolName,
+              action: task.action,
+              args: task.args,
+            })
+          );
+        } catch (error) {
+          console.error('Error fetching tasks from todo MCP in fallback:', error);
+          sendSse(res, 'planner_status', { state: 'completed', plan: [] });
+        }
+      }
+
       // Extract the final output from the result
       assistantResponse = result.finalOutput || '';
       console.log('Response received, length:', assistantResponse.length);
-      
+
       // First, send the conversation ID (needed for UI to work properly)
       sendSse(res, 'conversation_id', { conv_id: conversationId });
-      
+
       // Stream response to client as a single delta (could be chunked for real streaming)
       sendSse(res, 'assistant_delta', { delta: assistantResponse });
-      
+
       // Send done event to mark completion
       sendSse(res, 'done', {});
       

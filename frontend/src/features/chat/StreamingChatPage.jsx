@@ -8,8 +8,6 @@ import { TaskProgress } from "@components/chat/TaskProgress";
 import { Text, TextLink } from "@common/text";
 import { Avatar } from "@common/avatar";
 import logo from "../../../static/EspressoBotLogo.png";
-import { Label } from '@common/fieldset'
-import { Switch, SwitchField } from '@common/switch'
 
 
 function StreamingChatPage({ convId }) {
@@ -30,7 +28,7 @@ function StreamingChatPage({ convId }) {
   const [imageUrl, setImageUrl] = useState("");
   const [showImageUrlInput, setShowImageUrlInput] = useState(false);
   const [useBasicAgent, setUseBasicAgent] = useState(true);
-  const [useNonAgentic, setUseNonAgentic] = useState(false);
+  const [hasShownTasks, setHasShownTasks] = useState(false);
   const messagesEndRef = useRef(null);
   const eventSourceRef = useRef(null);
   const readerRef = useRef(null);
@@ -45,6 +43,8 @@ function StreamingChatPage({ convId }) {
       console.warn('FRONTEND: convId is null in useEffect[convId]. Clearing messages/suggestions. convId:', convId);
       setMessages([]);
       setSuggestions([]);
+      setCurrentTasks([]);
+      setHasShownTasks(false);
       setActiveConv(null);
       return;
     }
@@ -54,6 +54,7 @@ function StreamingChatPage({ convId }) {
       .then(({ messages: fetchedMessages, tasks: persistedTasks }) => {
         setMessages(fetchedMessages);
         setCurrentTasks(persistedTasks);
+        setHasShownTasks(persistedTasks && persistedTasks.length > 0); // Set based on existing tasks
         setActiveConv(convId);
         const lastMessage = fetchedMessages[fetchedMessages.length - 1];
         if (
@@ -69,6 +70,8 @@ function StreamingChatPage({ convId }) {
       .catch(() => {
         setMessages([]);
         setSuggestions([]);
+        setCurrentTasks([]);
+        setHasShownTasks(false);
         console.error('FRONTEND: Error fetching conversation in useEffect[convId]. Clearing messages/suggestions. convId:', convId);
       })
       .finally(() => setLoading(false));
@@ -79,21 +82,9 @@ function StreamingChatPage({ convId }) {
     console.log("FRONTEND RENDER: useBasicAgent:", useBasicAgent, "currentPlan:", currentPlan, "currentTasks:", currentTasks,
     "streamingMessage:", streamingMessage); // DEBUG
     
-          // Fallback: if the LLM spits back a pure plan JSON instead of using tool events,
-          // detect it on stream completion and seed currentPlan.
-          useEffect(() => {
-            if (useBasicAgent && streamingMessage?.isComplete && !currentPlan && streamingMessage.content) {
-              try {
-                const pkg = JSON.parse(streamingMessage.content);
-                if (pkg.response && Array.isArray(pkg.response.tasks)) {
-                  console.log("FRONTEND: parsed direct plan JSON, setting currentPlan:", pkg.response.tasks);
-                  setCurrentPlan(pkg.response.tasks);
-                }
-              } catch (_e) {
-                // not JSON or not a plan, ignore
-              }
-            }
-          }, [useBasicAgent, streamingMessage, currentPlan]);
+          // Legacy direct-plan fallback no longer used in agentic-only mode.
+          // Agentic mode handles planning phases via 'planner_status' SSE events.
+          useEffect(() => {}, []);
 
 
   // Auto-scroll to bottom when messages change
@@ -314,7 +305,7 @@ function StreamingChatPage({ convId }) {
     setIsSending(true);
     setInput('');
     setSuggestions([]);
-    setCurrentTasks([]);
+    // Don't reset currentTasks or hasShownTasks - keep them persistent!
     setImageAttachment(null); // Clear attachment after sending
     setImageUrl("");
     setShowImageUrlInput(false);
@@ -332,14 +323,9 @@ function StreamingChatPage({ convId }) {
     }
 
     try {
-      // Determine which endpoint to use based on agent mode
-      let fetchUrl = "/api/agent/basic/run"; // Default to basic agent
-      if (useNonAgentic) {
-        fetchUrl = "/stream_chat"; // Use non-agentic mode
-        console.log("Using non-agentic endpoint");
-      } else {
-        console.log("Using unified basic agent endpoint with agentic architecture");
-      }
+      // Use master agent orchestrator v2 endpoint by default
+      const fetchUrl = "/api/agent/run";
+      console.log("Using master agent orchestrator endpoint");
 
       if (useBasicAgent) {
         setPlannerStatus("Initializing...");
@@ -430,11 +416,7 @@ function StreamingChatPage({ convId }) {
               if (!eventName && useBasicAgent && parsedData.type) {
                 eventName = parsedData.type;
                 actualEventPayload = parsedData.data !== undefined ? parsedData.data : {}; // Use .data if it exists, otherwise empty obj
-              } else if (!eventName && useNonAgentic && singleEventString.startsWith('data:')) {
-                // Legacy /stream_chat handling (eventName remains null, payload is parsedData)
-                actualEventPayload = parsedData;
               }
-              
               console.log("Processed SSE Event -- Name:", eventName, "Payload:", actualEventPayload);
 
               // Handle 'done' event regardless of agent mode
@@ -458,45 +440,90 @@ function StreamingChatPage({ convId }) {
             
               if (useBasicAgent) {
                 switch (eventName) {
+                case 'conv_id':
+                  if (actualEventPayload.conversationId && activeConv !== actualEventPayload.conversationId) {
+                    setActiveConv(actualEventPayload.conversationId);
+                  }
+                  break;
                 case 'conversation_id':
-                  if (actualEventPayload.conv_id && (!activeConv || activeConv !== actualEventPayload.conv_id)) {
-                    console.log("FRONTEND: Received 'conversation_id' event. Updating activeConv from", activeConv, "to", actualEventPayload.conv_id); // DEBUG
+                  if (actualEventPayload.conv_id && activeConv !== actualEventPayload.conv_id) {
                     setActiveConv(actualEventPayload.conv_id);
-                    // TODO: If the URL needs to be updated to reflect the new conv_id (e.g., for bookmarking or sharing),
-                    // a callback prop from the parent component (e.g., App.js or the router component)
-                    // that can trigger a URL change should be invoked here.
                   }
                   break;
-                case 'planner_status':
-                  console.log("FRONTEND: Received planner_status event:", JSON.stringify(actualEventPayload, null, 2));
-                  setPlannerStatus(actualEventPayload.state === 'completed' ? `Plan: ${actualEventPayload.state}` : `Planner: ${actualEventPayload.state}`);
-                  if (actualEventPayload.state === 'completed' && actualEventPayload.plan) {
-                    console.log("FRONTEND: Plan completed with plan:", actualEventPayload.plan);
-                    if (Array.isArray(actualEventPayload.plan)) {
-                      console.log("FRONTEND: Setting currentPlan from planner_status:", actualEventPayload.plan); // DEBUG
-                      setCurrentPlan(actualEventPayload.plan);
-                      
-                      // Convert plan tasks to task progress items
-                      const taskProgressItems = actualEventPayload.plan.map(task => ({
-                        id: task.id,
-                        content: task.description,
-                        status: 'pending',
-                        conversation_id: activeConv || convId,
-                        toolName: task.agent_tool_name,
-                        action: task.args?.action,
-                        args: task.args?.args || task.args
-                      }));
-                      
-                      console.log("FRONTEND: Creating task progress items:", taskProgressItems);
-                      setCurrentTasks(taskProgressItems);
-                    } else {
-                      console.warn("FRONTEND: Received plan is not an array:", actualEventPayload.plan);
-                      setCurrentPlan([]); // Set to empty array to avoid errors
+                case 'agent_status':
+                  const { status, tool } = actualEventPayload;
+                  console.log('FRONTEND: agent_status event, status:', status, 'tool:', tool);
+                  if (status === 'analyzing') {
+                    setPlannerStatus("Agent: analyzing request...");
+                  } else if (status === 'creating_task') {
+                    setPlannerStatus("Agent: creating task...");
+                  } else if (status === 'updating_task') {
+                    setDispatcherStatus("Agent: updating task...");
+                  } else if (status === 'searching') {
+                    setDispatcherStatus("Agent: searching...");
+                  } else if (status === 'processing') {
+                    setDispatcherStatus(`Agent: ${tool || 'processing'}...`);
+                  } else if (status === 'responding') {
+                    setSynthesizerStatus("Agent: responding...");
+                  }
+                  break;
+                case 'task_created':
+                  console.log('FRONTEND: task_created event:', actualEventPayload);
+                  const newTask = {
+                    id: `task-${actualEventPayload.taskId}`,
+                    content: `Task ${actualEventPayload.taskId}`,
+                    status: 'pending',
+                    conversation_id: actualEventPayload.conversation_id,
+                    toolName: 'todo_task'
+                  };
+                  setCurrentTasks(prevTasks => [...prevTasks, newTask]);
+                  break;
+                case 'task_updated':
+                  console.log('FRONTEND: task_updated event:', actualEventPayload);
+                  setCurrentTasks(prevTasks => {
+                    const taskIndex = prevTasks.findIndex(t => t.id === `task-${actualEventPayload.taskId}`);
+                    if (taskIndex !== -1) {
+                      const updatedTasks = [...prevTasks];
+                      updatedTasks[taskIndex] = {
+                        ...updatedTasks[taskIndex],
+                        status: actualEventPayload.status
+                      };
+                      return updatedTasks;
                     }
-                  } else {
-                    console.log("FRONTEND: Plan not completed or no plan in payload");
+                    return prevTasks;
+                  });
+                  break;
+                case 'task_summary':
+                  console.log('FRONTEND: task_summary event:', actualEventPayload);
+                  if (actualEventPayload.tasks && Array.isArray(actualEventPayload.tasks)) {
+                    setCurrentTasks(actualEventPayload.tasks);
+                    if (actualEventPayload.tasks.length > 0) {
+                      setHasShownTasks(true);
+                    }
                   }
                   break;
+                case 'planner_status': {
+                  const { state, plan } = actualEventPayload;
+                  console.log('FRONTEND: planner_status event, state:', state, 'raw plan:', plan);
+                  setPlannerStatus(state === 'completed' ? `Plan: ${state}` : `Planner: ${state}`);
+                  if (state === 'completed' && Array.isArray(plan)) {
+                    console.log('FRONTEND: updating currentPlan with', plan.length, 'items');
+                    setCurrentPlan(plan);
+                    const cid = activeConv || convId;
+                    const taskProgressItems = plan.map(task => {
+                      const id = task.id;
+                      const content = task.content ?? task.title ?? task.description ?? task.name ?? '';
+                      const statusInit = task.status ?? 'pending';
+                      const toolName = task.toolName ?? task.agent_tool_name ?? '';
+                      const action = task.action ?? (task.args && typeof task.args === 'object' && task.args.action) ?? '';
+                      const argsObj = task.args && typeof task.args === 'object' ? task.args : undefined;
+                      return { id, content, status: statusInit, conversation_id: cid, toolName, action, args: argsObj };
+                    });
+                    console.log('FRONTEND: setCurrentTasks from planner_status:', taskProgressItems);
+                    setCurrentTasks(taskProgressItems);
+                  }
+                  break;
+                }
                 case 'task_progress':
                   if (actualEventPayload.taskId && actualEventPayload.status) {
                     setCurrentTasks(prevTasks => {
@@ -510,8 +537,10 @@ function StreamingChatPage({ convId }) {
                           status: actualEventPayload.status,
                           content: actualEventPayload.description || updatedTasks[existingTaskIndex].content,
                           result: actualEventPayload.result,
+                          error: actualEventPayload.error,
                           conversation_id: activeConv || convId
                         };
+                        console.log('Updated task:', actualEventPayload.taskId, 'to status:', actualEventPayload.status);
                         return updatedTasks;
                       } else if (actualEventPayload.status === 'pending') {
                         // Add new pending task
@@ -519,8 +548,12 @@ function StreamingChatPage({ convId }) {
                           id: actualEventPayload.taskId,
                           status: actualEventPayload.status,
                           content: actualEventPayload.description || `Task ${actualEventPayload.taskId}`,
+                          toolName: actualEventPayload.toolName,
+                          action: actualEventPayload.action,
+                          args: actualEventPayload.args,
                           conversation_id: activeConv || convId
                         };
+                        console.log('Adding new pending task:', newTask);
                         return [...prevTasks, newTask];
                       }
                       return prevTasks;
@@ -845,13 +878,13 @@ function StreamingChatPage({ convId }) {
                           {currentPlan.map((step, index) => {
                           // Determine if this step is completed, errored, or in progress
                           const isCompleted = currentTasks.some(
-                            task => task.name === step.tool_name && task.status === 'completed'
+                            task => task.id === step.id && task.status === 'completed'
                           );
                           const isErrored = currentTasks.some(
-                            task => task.name === step.tool_name && task.status === 'error'
+                            task => task.id === step.id && task.status === 'error'
                           );
                           const isInProgress = currentTasks.some(
-                            task => task.name === step.tool_name && task.status === 'in_progress'
+                            task => task.id === step.id && task.status === 'in_progress'
                           );
 
                           let stepStyle = {};
@@ -874,7 +907,7 @@ function StreamingChatPage({ convId }) {
                           return (
                             <li key={index} style={stepStyle} className="mb-0.5">
                               <span className="mr-1">{statusIndicator}</span>
-                              <span><strong>{step.tool_name}:</strong> {step.description}</span>
+                              <span><strong>{step.toolName}:</strong> {step.content}</span>
                             </li>
                           );
                         })}
@@ -882,9 +915,11 @@ function StreamingChatPage({ convId }) {
                       </div>
                     )}
 
-                    {/* Task Progress - only if useBasicAgent is true */}
-                    {useBasicAgent && (currentTasks.length > 0 || plannerStatus || dispatcherStatus || synthesizerStatus) && (
-                      <div className="mb-2">
+                    {/* Task Progress - show if there are tasks, active statuses, or we've shown tasks before (sticky) */}
+                    {/* Task Progress - show if there are tasks, active statuses, or we've shown tasks before (sticky) */}
+                    {useBasicAgent && (currentTasks.length > 0 || plannerStatus || dispatcherStatus || synthesizerStatus || isSending || hasShownTasks) && (
+                      <div className="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
+                        <div className="text-sm font-medium text-blue-700 dark:text-blue-300 mb-2">Task Progress</div>
                         <TaskProgress
                           tasks={currentTasks}
                           onInterrupt={handleInterrupt}
@@ -944,23 +979,6 @@ function StreamingChatPage({ convId }) {
           </div>
         )}
 
-        {/* Agent Mode Toggle */}
-        <div className="mt-2 flex items-center justify-between gap-4">
-          <div className="flex items-center space-x-6">
-            <SwitchField>
-              <Label htmlFor="non-agentic-mode">Non-Agentic Mode</Label>
-              <Switch 
-                checked={useNonAgentic} 
-                onChange={(checked) => {
-                  setUseNonAgentic(checked);
-                  setUseBasicAgent(!checked);
-                }} 
-                name="non-agentic-mode" 
-                defaultChecked={useNonAgentic} 
-              />
-            </SwitchField>
-          </div>
-        </div>
         {imageAttachment && (
           <div className="max-w-3xl w-full mx-auto px-4 mb-2">
             <div className="relative inline-block">

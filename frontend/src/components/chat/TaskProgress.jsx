@@ -10,7 +10,8 @@ export function TaskProgress({ tasks, onInterrupt, isStreaming, conversationId, 
     tasks.filter(task => !task.conversation_id || task.conversation_id === conversationId) : 
     tasks;
   
-  if (!filteredTasks || filteredTasks.length === 0) {
+  const showStatus = Boolean(plannerStatus || dispatcherStatus || synthesizerStatus);
+  if ((!filteredTasks || filteredTasks.length === 0) && !showStatus) {
     return null;
   }
 
@@ -64,7 +65,7 @@ export function TaskProgress({ tasks, onInterrupt, isStreaming, conversationId, 
             <div className="flex items-center gap-1">
               <div className="h-2 w-2 bg-blue-500 rounded-full animate-pulse"></div>
               <Text className="text-xs text-blue-700 dark:text-blue-300">
-                {synthesizerStatus || dispatcherStatus || plannerStatus}
+                {plannerStatus || dispatcherStatus || synthesizerStatus}
               </Text>
             </div>
           )}

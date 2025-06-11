@@ -69,10 +69,14 @@ export default defineConfig({
         const chatHandler = (await import('./server/chat')).default;
         const convHandler = (await import('./server/conversations')).default;
         const streamChatHandler = (await import('./server/stream_chat')).default;
-        // Agent orchestrator v2 removed - using basic orchestrator for all agent modes
-        const basicOrchestratorRouter = (await import('./server/basic_orchestrator_simple')).default;
+        // Unified orchestrator (new simplified architecture)
+        const unifiedOrchestratorRouter = (await import('./server/unified-orchestrator')).default;
+        // Agent orchestrator v2 (streams planner, task, and synthesizer events)
+        const basicOrchestratorRouter = (await import('./server/basic_orchestrator')).default;
+        // Fallback simple orchestrators (basic-simple and super-simple) for legacy/testing
+        const simpleOrchestratorRouter = (await import('./server/basic_orchestrator_simple')).default;
         const superSimpleOrchestratorRouter = (await import('./server/super-simple-orchestrator')).default;
-        const testSseRouter = (await import('./server/test-sse')).default; // Import the test SSE router
+        const testSseRouter = (await import('./server/test-sse')).default;
 
         const apiApp = express();
         apiApp.use(bodyParser.json({ limit: '50mb' }));
@@ -80,9 +84,12 @@ export default defineConfig({
         apiApp.use('/api/conversations', convHandler);
         apiApp.use('/api/chat', chatHandler);
         apiApp.use('/stream_chat', streamChatHandler);
-        // V2 agent orchestrator route removed - all agent modes use basic orchestrator
-        apiApp.use('/api/agent/basic', basicOrchestratorRouter); // Add the simple basic agent route
-        apiApp.use('/api/agent/super-simple', superSimpleOrchestratorRouter); // Add the super simple agent WITHOUT MCP
+        // Master Agent endpoint: use unified orchestrator for all agent mode requests
+        apiApp.use('/api/agent', unifiedOrchestratorRouter);
+        // Legacy orchestrators for testing/comparison
+        apiApp.use('/api/agent/v2', basicOrchestratorRouter);
+        apiApp.use('/api/agent/basic', simpleOrchestratorRouter);
+        apiApp.use('/api/agent/super-simple', superSimpleOrchestratorRouter);
         apiApp.use('/api/sse', testSseRouter); // Add the SSE test endpoint for debugging
         server.middlewares.use(apiApp);
       },

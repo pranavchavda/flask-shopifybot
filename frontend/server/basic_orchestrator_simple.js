@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import * as prismaClient from '@prisma/client';
 import { run } from '@openai/agents';
-import { basicChatAgent } from './basic-agent.js';
+import { basicChatAgent, todoMCPServer } from './basic-agent.js';
 
 const PrismaClient = prismaClient.PrismaClient;
 const prisma = new PrismaClient();
@@ -25,28 +25,13 @@ function sendSse(res, eventName, data) {
   }
 }
 
-// Fetch tasks from todo MCP server
 async function fetchTodoTasks() {
   try {
-    const { MCPServerStdio } = await import('@openai/agents');
-    const todoMCPServer = new MCPServerStdio({
-      name: 'Todo MCP Server for Task Retrieval',
-      command: 'npx',
-      args: ['-y', '@pranavchavda/todo-mcp-server'],
-      env: process.env,
-      shell: true,
-    });
-    
-    await todoMCPServer.connect();
-    
-    const tasksResult = await todoMCPServer.callTool('list_tasks', { 
+    const tasksResult = await todoMCPServer.callTool('list_tasks', {
       limit: 20,
       order: 'created_at',
-      direction: 'desc'
+      direction: 'desc',
     });
-    
-    await todoMCPServer.close();
-    
     return tasksResult;
   } catch (error) {
     console.error('Error fetching tasks from todo MCP:', error);
@@ -55,7 +40,7 @@ async function fetchTodoTasks() {
 }
 
 router.post('/run', async (req, res) => {
-  console.log('\n========= BASIC ORCHESTRATOR REQUEST RECEIVED =========');
+  console.log('\n========= BASIC ORCHESTRATOR REQUEST RECEIVED asdasd =========');
   const { message, conv_id: existing_conv_id } = req.body || {};
   let conversationId = existing_conv_id;
 
@@ -134,43 +119,80 @@ router.post('/run', async (req, res) => {
 
     // Run agent
     console.log('Running basic agent...');
-    const result = await run(basicChatAgent, agentInput);
+    let createdTasks = [];
+    let dispatcherResults = [];
+    
+    const result = await run(basicChatAgent, agentInput, {
+      onStepFinish: (step) => {
+        console.log('Step finished:', step);
+      }
+    });
     console.log('Agent run completed');
+    console.log('Agent result:', result);
     
-    // Now fetch tasks directly from todo MCP server
-    console.log('Fetching tasks from todo MCP server...');
-    const tasksResult = await fetchTodoTasks();
-    
-    if (tasksResult && tasksResult.tasks && tasksResult.tasks.length > 0) {
-      // Convert to our task progress format
-      const taskProgressItems = tasksResult.tasks.map(task => ({
-        id: task.id,
-        content: task.title,
-        status: task.status === 'completed' ? 'completed' : 'pending',
-        conversation_id: conversationId,
-        toolName: 'todo_task',
-        action: task.description,
-        args: task
-      }));
-      
-      console.log('Sending task progress items to frontend:', taskProgressItems.length, 'tasks');
-      
-      // Send planner status with the tasks
-      sendSse(res, 'planner_status', { state: 'completed', plan: taskProgressItems });
-      
-      // Send individual task progress events
-      taskProgressItems.forEach(task => {
-        sendSse(res, 'task_progress', {
-          taskId: task.id,
-          status: task.status,
-          description: task.content,
-          toolName: task.toolName,
-          action: task.action,
-          args: task.args
-        });
+    // After agent completes, fetch the created tasks
+    try {
+      const tasksResult = await todoMCPServer.callTool('list_tasks', {
+        limit: 20,
+        order: 'created_at',
+        direction: 'desc',
       });
-    } else {
-      console.log('No tasks found in todo MCP');
+      
+      console.log('Fetched tasks from todo MCP:', tasksResult);
+      
+      let tasksArray = [];
+      if (Array.isArray(tasksResult)) {
+        if (tasksResult.length === 1 && typeof tasksResult[0]?.text === 'string') {
+          const text = tasksResult[0].text;
+          const match = text.match(/(\[.*\])/s);
+          if (match) {
+            try {
+              tasksArray = JSON.parse(match[1]);
+            } catch (err) {
+              console.error('Error parsing tasks JSON:', err);
+            }
+          }
+        } else {
+          tasksArray = tasksResult;
+        }
+      } else if (tasksResult?.tasks && Array.isArray(tasksResult.tasks)) {
+        tasksArray = tasksResult.tasks;
+      }
+      
+      // Filter to only show recently created tasks (within last few minutes)
+      const recentCutoff = new Date(Date.now() - 5 * 60 * 1000); // 5 minutes ago
+      const recentTasks = tasksArray.filter(task => {
+        const createdAt = new Date(task.created_at);
+        return createdAt > recentCutoff;
+      });
+      
+      if (recentTasks.length > 0) {
+        const taskProgressItems = recentTasks.map((task, index) => ({
+          id: `task-${task.id}`,
+          content: task.title || task.description || '',
+          status: task.status === 'completed' ? 'completed' : 'pending',
+          conversation_id: conversationId,
+          toolName: 'todo_task',
+          action: task.description,
+          args: task
+        }));
+        sendSse(res, 'planner_status', { state: 'completed', plan: taskProgressItems });
+        
+        // Send individual task progress events
+        taskProgressItems.forEach(task => {
+          sendSse(res, 'task_progress', {
+            taskId: task.id,
+            status: task.status,
+            description: task.content,
+            toolName: task.toolName,
+            action: task.action
+          });
+        });
+      } else {
+        sendSse(res, 'planner_status', { state: 'completed', plan: [] });
+      }
+    } catch (err) {
+      console.error('Error fetching tasks:', err);
       sendSse(res, 'planner_status', { state: 'completed', plan: [] });
     }
     
